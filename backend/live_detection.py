@@ -16,7 +16,9 @@ import threading
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-MODEL_DIR = r"E:\AI ATTENDANCE\Attendance\backend\buffalo_l"
+# Get the directory where this script is located, then look for buffalo_l folder
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(SCRIPT_DIR, "buffalo_l")
 DETECTION_MODEL = "det_10g.onnx"
 RECOGNITION_MODEL = "w600k_r50.onnx"
 
