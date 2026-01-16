@@ -28,7 +28,9 @@ def load_models():
         return _det_session, _rec_session
     
     try:
-        model_dir = r"E:\AI ATTENDANCE\Attendance\backend\buffalo_l"
+        # Get the directory where this script is located, then look for buffalo_l folder
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_dir = os.path.join(script_dir, "buffalo_l")
         det_model_path = os.path.join(model_dir, "det_10g.onnx")
         rec_model_path = os.path.join(model_dir, "w600k_r50.onnx")
         
