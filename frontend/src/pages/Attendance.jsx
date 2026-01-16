@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
+import { getEdgeFunction } from '../lib/api'
 import './Attendance.css'
 
 function Attendance({ userRole }) {
@@ -61,18 +62,12 @@ function Attendance({ userRole }) {
       setLoading(true)
       setError(null)
 
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) {
-        setError('Not authenticated. Please log in again.')
-        return
-      }
-
-      // Build query parameters
-      const params = new URLSearchParams()
+      // Build query parameters object
+      const queryParams = {}
       
       if (dateFilter === 'today') {
         const today = new Date().toISOString().split('T')[0]
-        params.append('date', today)
+        queryParams.date = today
       } else if (dateFilter === 'week') {
         const today = new Date()
         const weekStart = new Date(today)
@@ -80,49 +75,31 @@ function Attendance({ userRole }) {
         const weekEnd = new Date(weekStart)
         weekEnd.setDate(weekStart.getDate() + 6) // End of week
         
-        params.append('start_date', weekStart.toISOString().split('T')[0])
-        params.append('end_date', weekEnd.toISOString().split('T')[0])
+        queryParams.start_date = weekStart.toISOString().split('T')[0]
+        queryParams.end_date = weekEnd.toISOString().split('T')[0]
       } else if (dateFilter === 'month') {
         const today = new Date()
         const monthStart = new Date(today.getFullYear(), today.getMonth(), 1)
         const monthEnd = new Date(today.getFullYear(), today.getMonth() + 1, 0)
         
-        params.append('start_date', monthStart.toISOString().split('T')[0])
-        params.append('end_date', monthEnd.toISOString().split('T')[0])
+        queryParams.start_date = monthStart.toISOString().split('T')[0]
+        queryParams.end_date = monthEnd.toISOString().split('T')[0]
       } else if (dateFilter === 'custom' && customStartDate && customEndDate) {
-        params.append('start_date', customStartDate)
-        params.append('end_date', customEndDate)
+        queryParams.start_date = customStartDate
+        queryParams.end_date = customEndDate
       }
       // 'all' doesn't add date params
 
       if (statusFilter !== 'all') {
-        params.append('status', statusFilter)
+        queryParams.status = statusFilter
       }
 
       if (isAdmin && selectedEmployee !== 'all') {
-        params.append('employee_id', selectedEmployee)
+        queryParams.employee_id = selectedEmployee
       }
 
-      // Build URL with query parameters
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'http://127.0.0.1:54321'
-      const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0'
-      
-      const baseUrl = `${supabaseUrl}/functions/v1/get-attendance`
-      const queryString = params.toString()
-      const url = queryString ? `${baseUrl}?${queryString}` : baseUrl
-
-      const response = await fetch(url, {
-        headers: {
-          'Authorization': `Bearer ${session.access_token}`,
-          'apikey': supabaseKey,
-        },
-      })
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-      }
-
-      const result = await response.json()
+      // Use the API helper function which handles authentication properly
+      const result = await getEdgeFunction('get-attendance', queryParams)
 
       if (result.error) {
         throw new Error(result.error)

@@ -13,9 +13,16 @@ serve(async (req) => {
   }
 
   try {
-    // Get the authorization header
-    const authHeader = req.headers.get('Authorization')
+    // Get the authorization header - check multiple possible header names
+    const authHeader = req.headers.get('Authorization') || 
+                      req.headers.get('authorization') ||
+                      req.headers.get('x-authorization')
+    
+    console.log('Auth header present:', !!authHeader)
+    console.log('Request headers:', Object.fromEntries(req.headers.entries()))
+    
     if (!authHeader) {
+      console.error('Missing authorization header')
       return new Response(
         JSON.stringify({ error: 'Missing authorization header' }),
         { 
@@ -25,10 +32,25 @@ serve(async (req) => {
       )
     }
 
-    // Create Supabase client with service role key for admin access
+    // Get environment variables
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')
+    
+    if (!supabaseUrl || !supabaseAnonKey) {
+      console.error('Missing Supabase environment variables')
+      return new Response(
+        JSON.stringify({ error: 'Server configuration error' }),
+        { 
+          status: 500, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        }
+      )
+    }
+
+    // Create Supabase client with ANON_KEY for user verification (like interviewcoach)
     const supabaseClient = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
+      supabaseUrl,
+      supabaseAnonKey,
       {
         global: {
           headers: { Authorization: authHeader },
@@ -36,15 +58,25 @@ serve(async (req) => {
       }
     )
 
-    // Get the user from the auth token
+    // Verify user authentication with ANON_KEY client
     const {
       data: { user },
       error: userError,
     } = await supabaseClient.auth.getUser()
 
+    console.log('User verification result:', { 
+      hasUser: !!user, 
+      userId: user?.id, 
+      error: userError?.message 
+    })
+
     if (userError || !user) {
+      console.error('User verification failed:', userError)
       return new Response(
-        JSON.stringify({ error: 'Unauthorized' }),
+        JSON.stringify({ 
+          error: 'Unauthorized', 
+          message: userError?.message || 'Invalid or missing auth token' 
+        }),
         { 
           status: 401, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -52,7 +84,7 @@ serve(async (req) => {
       )
     }
 
-    // Get user role from profiles table
+    // Get user role from profiles table using the user client (with RLS)
     const { data: profile, error: profileError } = await supabaseClient
       .from('profiles')
       .select('role')

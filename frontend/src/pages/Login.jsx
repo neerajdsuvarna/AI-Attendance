@@ -24,12 +24,16 @@ function Login() {
 
       if (authError) throw authError
 
-      if (data.user) {
+      if (data.user && data.session) {
         // Call edge function to check role and get redirect info
+        // Explicitly pass Authorization header to ensure it's sent
+        // The edge function gets the user from the JWT token, so no body needed
         const { data: roleData, error: roleError } = await supabase.functions.invoke(
           'check-user-role',
           {
-            body: { userId: data.user.id },
+            headers: {
+              Authorization: `Bearer ${data.session.access_token}`,
+            },
           }
         )
 
