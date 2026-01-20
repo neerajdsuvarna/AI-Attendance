@@ -37,6 +37,8 @@ SUPABASE_ANON_KEY = None
 det_session = None
 rec_session = None
 face_cache = {}  # Cache for employee embeddings
+cache_lock = threading.Lock()  # Lock for thread-safe cache operations
+cache_loading = False  # Flag to prevent concurrent cache loads
 
 # Attendance tracking configuration
 ATTENDANCE_CONFIG = {
@@ -54,21 +56,57 @@ ATTENDANCE_CONFIG = {
 # MODEL LOADING
 # ============================================================================
 def load_models():
-    """Load ONNX models for detection and recognition"""
+    """Load ONNX models for detection and recognition with optimized CPU settings"""
     global det_session, rec_session
     
     if det_session is None or rec_session is None:
-        print("Loading face recognition models...")
+        print("Loading face recognition models with CPU optimization...")
         try:
+            # Configure session options for better CPU performance
+            sess_options = ort.SessionOptions()
+            
+            # Use all available CPU threads (0 = use all)
+            sess_options.intra_op_num_threads = 0  # Use all cores for single operations
+            sess_options.inter_op_num_threads = 0  # Use all cores for parallel operations
+            
+            # Enable optimizations
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            
+            # Set execution mode for better performance
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            
+            # CPU provider options for better performance
+            cpu_provider_options = {
+                'arena_extend_strategy': 'kSameAsRequested',
+                'enable_cpu_mem_arena': True,
+            }
+            
+            # Try to use GPU if available, fallback to optimized CPU
+            available_providers = ort.get_available_providers()
+            providers = []
+            
+            if 'CUDAExecutionProvider' in available_providers:
+                print("[INFO] CUDA GPU available - using GPU acceleration")
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            else:
+                print(f"[INFO] Using CPU with {os.cpu_count()} cores")
+                providers = ['CPUExecutionProvider']
+            
             det_session = ort.InferenceSession(
                 os.path.join(MODEL_DIR, DETECTION_MODEL),
-                providers=['CPUExecutionProvider']
+                sess_options=sess_options,
+                providers=providers,
+                provider_options=[cpu_provider_options] if 'CUDAExecutionProvider' not in providers else []
             )
+            
             rec_session = ort.InferenceSession(
                 os.path.join(MODEL_DIR, RECOGNITION_MODEL),
-                providers=['CPUExecutionProvider']
+                sess_options=sess_options,
+                providers=providers,
+                provider_options=[cpu_provider_options] if 'CUDAExecutionProvider' not in providers else []
             )
-            print("[OK] Models loaded successfully")
+            
+            print(f"[OK] Models loaded successfully using: {det_session.get_providers()}")
         except Exception as e:
             print(f"[ERROR] Failed to load models: {e}")
             raise
@@ -296,48 +334,73 @@ def fetch_employee_embeddings(auth_token: str) -> Dict:
 
 def load_face_cache_from_edge(auth_token: str) -> Dict:
     """
-    Load employee embeddings from edge function and build cache
+    Load employee embeddings from edge function and build cache (thread-safe)
     Returns: face_cache dict with employee_id -> {name, embedding}
     """
-    global face_cache
+    global face_cache, cache_lock, cache_loading
     
-    result = fetch_employee_embeddings(auth_token)
+    # Check if cache is already loaded (fast path, no lock needed)
+    if len(face_cache) > 0:
+        return face_cache
     
-    if not result.get('success'):
-        print(f"[ERROR] Failed to fetch embeddings: {result.get('error')}")
-        return {}
-    
-    employees = result.get('employees', [])
-    cache = {}
-    
-    for emp in employees:
-        emp_id = emp['id']
-        emp_name = emp['name']
-        embeddings_b64 = emp.get('face_embeddings')
+    # Acquire lock to prevent concurrent loading
+    with cache_lock:
+        # Double-check after acquiring lock (another thread might have loaded it)
+        if len(face_cache) > 0:
+            return face_cache
         
-        if embeddings_b64:
-            try:
-                # Decode base64 embedding
-                embedding_bytes = base64.b64decode(embeddings_b64)
-                embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+        # Check if another thread is already loading
+        if cache_loading:
+            # Wait a bit and check again
+            import time
+            time.sleep(0.1)
+            if len(face_cache) > 0:
+                return face_cache
+        
+        # Set loading flag
+        cache_loading = True
+        
+        try:
+            result = fetch_employee_embeddings(auth_token)
+            
+            if not result.get('success'):
+                print(f"[ERROR] Failed to fetch embeddings: {result.get('error')}")
+                return {}
+            
+            employees = result.get('employees', [])
+            cache = {}
+            
+            for emp in employees:
+                emp_id = emp['id']
+                emp_name = emp['name']
+                embeddings_b64 = emp.get('face_embeddings')
                 
-                # Normalize
-                norm = np.linalg.norm(embedding)
-                if norm > 0:
-                    embedding = embedding / norm
-                
-                cache[emp_id] = {
-                    'name': emp_name,
-                    'email': emp.get('email', ''),
-                    'embedding': embedding
-                }
-            except Exception as e:
-                print(f"[WARNING] Failed to decode embedding for {emp_name}: {e}")
-                continue
-    
-    face_cache = cache
-    print(f"[OK] Loaded {len(cache)} employee embeddings into cache")
-    return cache
+                if embeddings_b64:
+                    try:
+                        # Decode base64 embedding
+                        embedding_bytes = base64.b64decode(embeddings_b64)
+                        embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                        
+                        # Normalize
+                        norm = np.linalg.norm(embedding)
+                        if norm > 0:
+                            embedding = embedding / norm
+                        
+                        cache[emp_id] = {
+                            'name': emp_name,
+                            'email': emp.get('email', ''),
+                            'embedding': embedding
+                        }
+                    except Exception as e:
+                        print(f"[WARNING] Failed to decode embedding for {emp_name}: {e}")
+                        continue
+            
+            face_cache = cache
+            print(f"[OK] Loaded {len(cache)} employee embeddings into cache")
+            return cache
+        finally:
+            # Always clear loading flag
+            cache_loading = False
 
 
 # ============================================================================
@@ -388,7 +451,7 @@ def detect_faces_in_frame(frame: np.ndarray, auth_token: str = None, track_atten
     # Load models if not loaded
     load_models()
     
-    # Load face cache if empty and token provided
+    # Load face cache if empty and token provided (thread-safe)
     if len(face_cache) == 0 and auth_token:
         load_face_cache_from_edge(auth_token)
     

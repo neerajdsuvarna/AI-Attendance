@@ -26,19 +26,28 @@ function LiveDetection({ userRole }) {
   const cameraRetryCountRef = useRef(0)
   const MAX_RETRIES = 3
   const drawIntervalRef = useRef(null)
+  const animationFrameRef = useRef(null)
 
-  // Frame capture function
+  // Frame capture function - optimized for faster transmission
   const captureFrame = useCallback(() => {
     if (!videoRef.current || !videoRef.current.videoWidth || !videoRef.current.videoHeight) {
       return null
     }
 
     const canvas = document.createElement('canvas')
-    canvas.width = videoRef.current.videoWidth
-    canvas.height = videoRef.current.videoHeight
+    // Resize to max 960px width for faster network transfer (Raspberry Pi compatible size)
+    // Face detection models work fine at this resolution
+    const maxWidth = 960
+    const videoWidth = videoRef.current.videoWidth
+    const videoHeight = videoRef.current.videoHeight
+    const scale = Math.min(1, maxWidth / videoWidth)
+    
+    canvas.width = videoWidth * scale
+    canvas.height = videoHeight * scale
     const ctx = canvas.getContext('2d')
     ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height)
-    return canvas.toDataURL('image/jpeg', 0.8)
+    // Reduce quality to 0.5 for faster transmission (still good quality for face detection)
+    return canvas.toDataURL('image/jpeg', 0.5)
   }, [])
 
   // Start camera when component mounts
@@ -160,10 +169,18 @@ function LiveDetection({ userRole }) {
     startCamera()
 
     return () => {
-      stopCamera()
+      // Stop everything in proper order
+      sendingFramesRef.current = false
+      stopFrameSending()
       stopDetection()
+      stopCamera()
+      
+      // Clean up socket
       if (socketRef.current) {
-        socketRef.current.disconnect()
+        socketRef.current.removeAllListeners()
+        if (socketRef.current.connected) {
+          socketRef.current.disconnect()
+        }
         socketRef.current = null
       }
     }
@@ -216,12 +233,18 @@ function LiveDetection({ userRole }) {
         console.log('🔗 Socket connected for face detection')
         setIsConnected(true)
         setError(null)
-        startFrameSending(session.access_token)
+        // Small delay to ensure socket is fully ready before sending frames
+        setTimeout(() => {
+          if (socketRef.current && socketRef.current.connected && isActive) {
+            startFrameSending(session.access_token)
+          }
+        }, 100)
       })
 
-      socket.on('disconnect', () => {
-        console.log('🔌 Socket disconnected')
+      socket.on('disconnect', (reason) => {
+        console.log('🔌 Socket disconnected:', reason)
         setIsConnected(false)
+        sendingFramesRef.current = false
         stopFrameSending()
       })
 
@@ -229,6 +252,8 @@ function LiveDetection({ userRole }) {
         console.error('🔌 Socket connection error:', error)
         setError('Connection failed - Backend may not be running')
         setIsConnected(false)
+        sendingFramesRef.current = false
+        stopFrameSending()
       })
 
       socket.on('detection_response', (data) => {
@@ -239,7 +264,17 @@ function LiveDetection({ userRole }) {
         }
 
         if (data.success && data.detections) {
-          // Store all detections for drawing bounding boxes
+          // Performance logging (remove in production)
+          const responseTime = performance.now()
+          if (window.lastFrameTime) {
+            const latency = responseTime - window.lastFrameTime
+            if (latency > 200) {
+              console.log(`[PERF] Frame processing took ${latency.toFixed(0)}ms`)
+            }
+          }
+          window.lastFrameTime = responseTime
+          
+          // Store all detections for drawing bounding boxes (immediate update for faster rendering)
           setAllDetections(data.detections || [])
           
           // Find the best recognized match for the badge
@@ -252,14 +287,15 @@ function LiveDetection({ userRole }) {
             })
             
             // Add to recent activity (only for recognized faces)
+            // Generate unique ID using timestamp + random number to avoid duplicate keys
             const activity = {
-              id: Date.now(),
+              id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
               name: bestMatch.name,
               similarity: bestMatch.similarity,
               timestamp: new Date().toLocaleTimeString()
             }
             setRecentActivity(prev => {
-              // Avoid duplicates in quick succession
+              // Avoid duplicates in quick succession (same person within 2 seconds)
               const exists = prev.some(a => a.name === activity.name && 
                 Math.abs(new Date(a.timestamp) - new Date(activity.timestamp)) < 2000)
               if (exists) return prev
@@ -281,9 +317,19 @@ function LiveDetection({ userRole }) {
     initSocket()
 
     return () => {
+      // Stop frame sending first
+      sendingFramesRef.current = false
+      stopFrameSending()
+      
+      // Then disconnect socket
       if (socketRef.current) {
         console.log('🔌 Cleaning up socket connection')
-        socketRef.current.disconnect()
+        // Remove all listeners to prevent memory leaks
+        socketRef.current.removeAllListeners()
+        // Disconnect if still connected
+        if (socketRef.current.connected) {
+          socketRef.current.disconnect()
+        }
         socketRef.current = null
       }
     }
@@ -291,6 +337,12 @@ function LiveDetection({ userRole }) {
 
   const startFrameSending = useCallback(async (authToken) => {
     if (!isActive || !socketRef.current) return
+    
+    // Verify socket is actually connected before starting
+    if (!socketRef.current.connected) {
+      console.log('📡 Socket not connected yet, waiting...')
+      return
+    }
     
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current)
@@ -301,7 +353,17 @@ function LiveDetection({ userRole }) {
     sendingFramesRef.current = true
     
     frameIntervalRef.current = setInterval(async () => {
-      if (!sendingFramesRef.current || !socketRef.current) return
+      // Check if we should still be sending
+      if (!sendingFramesRef.current || !socketRef.current) {
+        return
+      }
+
+      // Check if socket is actually connected
+      if (!socketRef.current.connected) {
+        console.log('📡 Socket not connected, stopping frame sending')
+        stopFrameSending()
+        return
+      }
 
       const img = captureFrame()
       if (!img) {
@@ -312,25 +374,31 @@ function LiveDetection({ userRole }) {
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token || authToken
 
-      try {
-        socketRef.current.emit('detection_frame', { 
-          image: img,
-          auth_token: token
-        })
-      } catch (error) {
-        console.warn('Frame sending error:', error)
+      // Check socket state before attempting to emit
+      if (!socketRef.current || !socketRef.current.connected) {
         stopFrameSending()
+        return
       }
-    }, 200) // Send frame every 200ms (5 FPS)
+
+      // Performance logging
+      window.lastFrameTime = performance.now()
+      
+      // Emit without try-catch - let Socket.IO handle errors internally
+      // The socket library will handle connection state automatically
+      socketRef.current.emit('detection_frame', { 
+        image: img,
+        auth_token: token
+      })
+    }, 100) // Send frame every 100ms (10 FPS) - increased from 200ms for faster response
   }, [isActive, captureFrame])
 
   const stopFrameSending = useCallback(() => {
+    sendingFramesRef.current = false
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current)
       frameIntervalRef.current = null
       console.log('📡 Frame sending stopped')
     }
-    sendingFramesRef.current = false
   }, [])
 
   const stopDetection = () => {
@@ -359,6 +427,11 @@ function LiveDetection({ userRole }) {
       return
     }
 
+    let lastVideoWidth = 0
+    let lastVideoHeight = 0
+    let lastDisplayWidth = 0
+    let lastDisplayHeight = 0
+
     const drawBoxes = () => {
       const video = videoRef.current
       const canvas = canvasRef.current
@@ -372,13 +445,20 @@ function LiveDetection({ userRole }) {
       const videoDisplayWidth = videoRect.width
       const videoDisplayHeight = videoRect.height
       
+      // Only resize canvas when dimensions actually change (MAJOR PERFORMANCE FIX!)
+      if (canvas.width !== videoDisplayWidth || canvas.height !== videoDisplayHeight ||
+          lastVideoWidth !== video.videoWidth || lastVideoHeight !== video.videoHeight) {
+        canvas.width = videoDisplayWidth
+        canvas.height = videoDisplayHeight
+        lastVideoWidth = video.videoWidth
+        lastVideoHeight = video.videoHeight
+        lastDisplayWidth = videoDisplayWidth
+        lastDisplayHeight = videoDisplayHeight
+      }
+      
       // Calculate scale factors
       const scaleX = videoDisplayWidth / video.videoWidth
       const scaleY = videoDisplayHeight / video.videoHeight
-
-      // Set canvas size to match video display size
-      canvas.width = videoDisplayWidth
-      canvas.height = videoDisplayHeight
 
       const ctx = canvas.getContext('2d')
       ctx.clearRect(0, 0, canvas.width, canvas.height)
@@ -456,14 +536,26 @@ function LiveDetection({ userRole }) {
       })
     }
 
-    // Draw boxes continuously
+    // Draw boxes immediately and use requestAnimationFrame for smooth rendering
     drawBoxes() // Draw immediately
-    drawIntervalRef.current = setInterval(drawBoxes, 100) // Update every 100ms
+    
+    const animate = () => {
+      drawBoxes()
+      animationFrameRef.current = requestAnimationFrame(animate)
+    }
+    animationFrameRef.current = requestAnimationFrame(animate)
+    
+    // Fallback interval in case requestAnimationFrame doesn't work
+    drawIntervalRef.current = setInterval(drawBoxes, 100) // Update every 100ms as backup
 
     return () => {
       if (drawIntervalRef.current) {
         clearInterval(drawIntervalRef.current)
         drawIntervalRef.current = null
+      }
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current)
+        animationFrameRef.current = null
       }
     }
   }, [isActive, allDetections])

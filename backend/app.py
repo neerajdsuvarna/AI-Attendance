@@ -370,9 +370,17 @@ def decode_image_base64(img_data):
         return None
 
 @socketio.on('connect')
-def handle_connect():
+def handle_connect(auth):
     """Handle client connection"""
     print('Client connected to face detection socket')
+    
+    # Pre-load models when client connects (non-blocking)
+    try:
+        from live_detection import load_models
+        load_models()
+        print("[INFO] Models pre-loaded on connection")
+    except Exception as e:
+        print(f"[WARNING] Could not pre-load models: {e}")
 
 @socketio.on('disconnect')
 def handle_disconnect():
