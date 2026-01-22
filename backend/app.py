@@ -5,6 +5,7 @@ Flask application for handling attendance system backend operations
 
 import os
 import sys
+import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -17,7 +18,10 @@ from live_detection import (
     detect_faces_in_frame,
     base64_to_image as live_base64_to_image,
     load_face_cache_from_edge,
-    attendance_tracker
+    clear_face_cache,
+    get_cached_embeddings,
+    attendance_tracker,
+    DETECT_SIZE as LIVE_DETECT_SIZE
 )
 import base64
 import cv2
@@ -83,7 +87,20 @@ CORS(app,
      allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept"])
 
 # Initialize Socket.IO
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# Use 'threading' mode but with proper configuration to avoid Werkzeug errors
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode='threading',
+    logger=False,
+    engineio_logger=False,
+    ping_timeout=60,
+    ping_interval=25
+)
+
+# Global flag to track if frame processing is in progress (prevents frame queuing)
+processing_frame = False
+processing_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────
 # Authentication Helper Functions
@@ -320,6 +337,7 @@ def live_detect_api():
 def reload_face_cache_api():
     """
     Reload employee embeddings cache from edge function
+    Forces a fresh reload by clearing cache and fetching new data
     Requires authentication
     """
     user, error_response, status_code = verify_supabase_token()
@@ -332,8 +350,9 @@ def reload_face_cache_api():
         if not auth_token:
             return jsonify({"error": "Missing authorization token"}), 401
         
-        # Reload cache
-        cache = load_face_cache_from_edge(auth_token)
+        # Clear cache first, then fetch fresh data (bypasses TTL)
+        clear_face_cache()
+        cache = get_cached_embeddings(auth_token)
         
         return jsonify({
             "success": True,
@@ -343,6 +362,32 @@ def reload_face_cache_api():
         
     except Exception as e:
         print(f"Error in reload_face_cache_api: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+@app.route('/api/face/clear-cache', methods=['POST'])
+def clear_face_cache_api():
+    """
+    Clear the face cache (useful after employee deletion)
+    Requires authentication
+    """
+    user, error_response, status_code = verify_supabase_token()
+    
+    if error_response:
+        return jsonify(error_response), status_code
+    
+    try:
+        # Clear cache
+        clear_face_cache()
+        
+        return jsonify({
+            "success": True,
+            "message": "Face cache cleared successfully"
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in clear_face_cache_api: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
@@ -389,7 +434,16 @@ def handle_disconnect():
 
 @socketio.on('detection_frame')
 def handle_detection_frame(data):
-    """Handle incoming video frame for face detection"""
+    """Handle incoming video frame for face detection with frame skipping to prevent queuing"""
+    global processing_frame
+    
+    # Skip frame if previous one is still processing (prevents queuing)
+    with processing_lock:
+        if processing_frame:
+            # Skip this frame - previous one is still processing
+            return
+        processing_frame = True
+    
     try:
         img_data = data.get("image")
         
@@ -446,6 +500,10 @@ def handle_detection_frame(data):
         import traceback
         traceback.print_exc()
         emit("detection_response", {"error": f"Internal server error: {str(e)}"})
+    finally:
+        # Always release the lock when done
+        with processing_lock:
+            processing_frame = False
 
 @socketio.on('stop_detection')
 def handle_stop_detection():
@@ -474,6 +532,116 @@ def internal_error(error):
 @app.errorhandler(413)
 def request_entity_too_large(error):
     return jsonify({"error": "File too large"}), 413
+
+# ─────────────────────────────────────────────────────
+# Camera Capabilities Storage
+# ─────────────────────────────────────────────────────
+# Store camera max resolution per session/client
+camera_capabilities = {
+    'max_width': 1920,  # Default fallback
+    'max_height': 1080  # Default fallback
+}
+
+# ─────────────────────────────────────────────────────
+# Detection Configuration Endpoint
+# ─────────────────────────────────────────────────────
+
+@app.route('/api/face/set-camera-capabilities', methods=['POST'])
+def set_camera_capabilities():
+    """
+    Receive camera maximum capabilities from frontend
+    Backend uses this to determine optimal detection resolution
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No data provided"}), 400
+        
+        max_width = data.get('max_width', 1920)
+        max_height = data.get('max_height', 1080)
+        
+        # Update global camera capabilities
+        global camera_capabilities
+        camera_capabilities['max_width'] = max_width
+        camera_capabilities['max_height'] = max_height
+        
+        print(f"[INFO] Camera capabilities updated: {max_width}x{max_height}")
+        
+        # Update camera capabilities in live_detection module
+        from live_detection import set_camera_capabilities, _update_settings_for_hardware, DETECT_SIZE
+        
+        # Set camera capabilities (this will trigger recalculation)
+        set_camera_capabilities(max_width, max_height)
+        
+        # Force update of settings to apply new camera capabilities
+        _update_settings_for_hardware()
+        
+        # Get the updated detect size
+        from live_detection import DETECT_SIZE as updated_detect_size
+        optimal_detect_size = updated_detect_size[0]
+        
+        return jsonify({
+            "success": True,
+            "message": "Camera capabilities received",
+            "optimal_detect_size": optimal_detect_size,
+            "camera_max": {"width": max_width, "height": max_height}
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to set camera capabilities: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/face/detection-config', methods=['GET'])
+def get_detection_config():
+    """
+    Get detection configuration (resolution, GPU status, etc.)
+    Frontend can use this to optimize image capture settings
+    """
+    try:
+        # Import here to avoid circular imports
+        from live_detection import _is_gpu_available, DETECT_SIZE
+        
+        is_gpu = _is_gpu_available()
+        detect_w, detect_h = DETECT_SIZE
+        
+        # Get camera capabilities if available
+        global camera_capabilities
+        camera_max_width = camera_capabilities.get('max_width', 1920)
+        camera_max_height = camera_capabilities.get('max_height', 1080)
+        
+        # Recommend frontend to send images at 1.5x the detect size for better quality
+        # But respect camera max capabilities and cap at reasonable maximum
+        recommended_max_width = min(int(detect_w * 1.5), camera_max_width, 1920)
+        
+        return jsonify({
+            "success": True,
+            "gpu_available": is_gpu,
+            "detect_size": {
+                "width": detect_w,
+                "height": detect_h
+            },
+            "camera_capabilities": {
+                "max_width": camera_max_width,
+                "max_height": camera_max_height
+            },
+            "recommended_capture": {
+                "max_width": recommended_max_width,
+                "quality": 0.7 if is_gpu else 0.5  # Higher quality for GPU
+            }
+        }), 200
+    except Exception as e:
+        print(f"[ERROR] Failed to get detection config: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": "Failed to get detection configuration",
+            "gpu_available": False,
+            "detect_size": {"width": 640, "height": 640},
+            "recommended_capture": {"max_width": 960, "quality": 0.5}
+        }), 500
 
 # ─────────────────────────────────────────────────────
 # Application Entry Point

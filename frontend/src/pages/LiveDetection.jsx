@@ -15,6 +15,9 @@ function LiveDetection({ userRole }) {
   const frameIntervalRef = useRef(null)
   const socketRef = useRef(null)
   const sendingFramesRef = useRef(false)
+  const sentImageDimensionsRef = useRef({ width: 0, height: 0 }) // Store dimensions of image sent to backend
+  const detectionConfigRef = useRef({ maxWidth: 960, quality: 0.5 }) // Detection config from backend
+  const cameraMaxResolutionRef = useRef({ width: 0, height: 0 }) // Store camera's maximum resolution
   
   const [isActive, setIsActive] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
@@ -28,27 +31,157 @@ function LiveDetection({ userRole }) {
   const drawIntervalRef = useRef(null)
   const animationFrameRef = useRef(null)
 
-  // Frame capture function - optimized for faster transmission
+  // Detect camera maximum capabilities
+  const detectCameraCapabilities = useCallback(async () => {
+    try {
+      // Try to get capabilities using getCapabilities() (modern browsers)
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: 'user' },
+        audio: false 
+      })
+      
+      const videoTrack = stream.getVideoTracks()[0]
+      if (videoTrack && videoTrack.getCapabilities) {
+        const capabilities = videoTrack.getCapabilities()
+        if (capabilities.width && capabilities.height) {
+          const maxWidth = capabilities.width.max || 1920
+          const maxHeight = capabilities.height.max || 1080
+          cameraMaxResolutionRef.current = { width: maxWidth, height: maxHeight }
+          console.log(`[INFO] Camera max resolution detected: ${maxWidth}x${maxHeight}`)
+          
+          // Send camera capabilities to backend
+          await sendCameraCapabilitiesToBackend(maxWidth, maxHeight)
+          
+          // Stop the test stream
+          stream.getTracks().forEach(track => track.stop())
+          return { width: maxWidth, height: maxHeight }
+        }
+      }
+      
+      // Fallback: Try to detect by checking actual video dimensions
+      // Request high resolution and see what we get
+      const testStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 3840, max: 3840 },
+          height: { ideal: 2160, max: 2160 },
+          facingMode: 'user'
+        },
+        audio: false
+      })
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = testStream
+        await new Promise((resolve) => {
+          if (videoRef.current) {
+            videoRef.current.onloadedmetadata = () => {
+              const actualWidth = videoRef.current.videoWidth
+              const actualHeight = videoRef.current.videoHeight
+              cameraMaxResolutionRef.current = { width: actualWidth, height: actualHeight }
+              console.log(`[INFO] Camera max resolution detected (fallback): ${actualWidth}x${actualHeight}`)
+              
+              // Send camera capabilities to backend
+              sendCameraCapabilitiesToBackend(actualWidth, actualHeight)
+              
+              testStream.getTracks().forEach(track => track.stop())
+              resolve()
+            }
+          } else {
+            resolve()
+          }
+        })
+      } else {
+        testStream.getTracks().forEach(track => track.stop())
+      }
+      
+      return cameraMaxResolutionRef.current
+    } catch (error) {
+      console.warn('[WARNING] Failed to detect camera capabilities, using defaults:', error)
+      // Default to reasonable values
+      cameraMaxResolutionRef.current = { width: 1920, height: 1080 }
+      return cameraMaxResolutionRef.current
+    }
+  }, [])
+
+  // Send camera capabilities to backend
+  const sendCameraCapabilitiesToBackend = useCallback(async (maxWidth, maxHeight) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/face/set-camera-capabilities`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          max_width: maxWidth,
+          max_height: maxHeight
+        })
+      })
+      
+      if (response.ok) {
+        const result = await response.json()
+        if (result.success) {
+          console.log(`[INFO] Camera capabilities sent to backend: ${maxWidth}x${maxHeight}`)
+          // Update detection config after backend processes camera capabilities
+          await fetchDetectionConfig()
+        }
+      }
+    } catch (error) {
+      console.warn('[WARNING] Failed to send camera capabilities to backend:', error)
+    }
+  }, [])
+
+  // Fetch detection configuration from backend
+  const fetchDetectionConfig = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/face/detection-config`)
+      if (response.ok) {
+        const config = await response.json()
+        if (config.success) {
+          detectionConfigRef.current = {
+            maxWidth: config.recommended_capture.max_width,
+            quality: config.recommended_capture.quality
+          }
+          console.log(`[INFO] Detection config loaded: maxWidth=${config.recommended_capture.max_width}, quality=${config.recommended_capture.quality}, GPU=${config.gpu_available}`)
+        }
+      }
+    } catch (error) {
+      console.warn('[WARNING] Failed to fetch detection config, using defaults:', error)
+    }
+  }, [])
+
+  // Frame capture function - optimized based on backend GPU/CPU capabilities
   const captureFrame = useCallback(() => {
     if (!videoRef.current || !videoRef.current.videoWidth || !videoRef.current.videoHeight) {
       return null
     }
 
     const canvas = document.createElement('canvas')
-    // Resize to max 960px width for faster network transfer (Raspberry Pi compatible size)
-    // Face detection models work fine at this resolution
-    const maxWidth = 960
+    const config = detectionConfigRef.current
+    const maxWidth = config.maxWidth || 960 // Fallback to 960 if config not loaded
+    const quality = config.quality || 0.5  // Fallback to 0.5 if config not loaded
+    
     const videoWidth = videoRef.current.videoWidth
     const videoHeight = videoRef.current.videoHeight
     const scale = Math.min(1, maxWidth / videoWidth)
     
-    canvas.width = videoWidth * scale
-    canvas.height = videoHeight * scale
+    const sentWidth = videoWidth * scale
+    const sentHeight = videoHeight * scale
+    
+    // Store sent image dimensions for coordinate scaling
+    // Backend returns coordinates in this sent image's coordinate space
+    sentImageDimensionsRef.current = { width: sentWidth, height: sentHeight }
+    
+    canvas.width = sentWidth
+    canvas.height = sentHeight
     const ctx = canvas.getContext('2d')
     ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height)
-    // Reduce quality to 0.5 for faster transmission (still good quality for face detection)
-    return canvas.toDataURL('image/jpeg', 0.5)
+    // Use quality from backend config (higher for GPU, lower for CPU)
+    return canvas.toDataURL('image/jpeg', quality)
   }, [])
+
+  // Fetch detection config on mount
+  useEffect(() => {
+    fetchDetectionConfig()
+  }, [fetchDetectionConfig])
 
   // Start camera when component mounts
   useEffect(() => {
@@ -77,10 +210,27 @@ function LiveDetection({ userRole }) {
           streamRef.current.getTracks().forEach(track => track.stop())
         }
 
+        // Detect camera capabilities first
+        const cameraMax = await detectCameraCapabilities()
+        const cameraMaxWidth = cameraMax?.width || 1920
+        const cameraMaxHeight = cameraMax?.height || 1080
+        
+        // Fetch detection config to determine optimal camera resolution
+        await fetchDetectionConfig()
+        const config = detectionConfigRef.current
+        const backendMaxWidth = config.maxWidth || 1920
+        
+        // Use the minimum of camera max and backend recommended max
+        // This ensures we don't exceed camera capabilities or backend processing limits
+        const idealWidth = Math.min(cameraMaxWidth, backendMaxWidth)
+        const idealHeight = Math.min(cameraMaxHeight, Math.round(idealWidth * 9 / 16))
+        
+        console.log(`[INFO] Requesting camera at: ${idealWidth}x${idealHeight} (camera max: ${cameraMaxWidth}x${cameraMaxHeight}, backend max: ${backendMaxWidth})`)
+
         const stream = await navigator.mediaDevices.getUserMedia({ 
           video: { 
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
+            width: { ideal: idealWidth, max: cameraMaxWidth },
+            height: { ideal: idealHeight, max: cameraMaxHeight },
             facingMode: 'user'
           }, 
           audio: false
@@ -233,12 +383,15 @@ function LiveDetection({ userRole }) {
         console.log('🔗 Socket connected for face detection')
         setIsConnected(true)
         setError(null)
-        // Small delay to ensure socket is fully ready before sending frames
-        setTimeout(() => {
-          if (socketRef.current && socketRef.current.connected && isActive) {
-            startFrameSending(session.access_token)
-          }
-        }, 100)
+        // Fetch latest detection config when socket connects
+        fetchDetectionConfig().then(() => {
+          // Small delay to ensure socket is fully ready before sending frames
+          setTimeout(() => {
+            if (socketRef.current && socketRef.current.connected && isActive) {
+              startFrameSending(session.access_token)
+            }
+          }, 100)
+        })
       })
 
       socket.on('disconnect', (reason) => {
@@ -389,7 +542,7 @@ function LiveDetection({ userRole }) {
         image: img,
         auth_token: token
       })
-    }, 100) // Send frame every 100ms (10 FPS) - increased from 200ms for faster response
+    }, 300) // Send frame every 300ms (~3.3 FPS) - optimized to match backend processing speed
   }, [isActive, captureFrame])
 
   const stopFrameSending = useCallback(() => {
@@ -457,8 +610,14 @@ function LiveDetection({ userRole }) {
       }
       
       // Calculate scale factors
-      const scaleX = videoDisplayWidth / video.videoWidth
-      const scaleY = videoDisplayHeight / video.videoHeight
+      // Backend returns coordinates in the SENT image's coordinate space (resized to 960px)
+      // We need to scale from sent image dimensions to display dimensions, not from original video dimensions
+      const sentWidth = sentImageDimensionsRef.current.width || video.videoWidth
+      const sentHeight = sentImageDimensionsRef.current.height || video.videoHeight
+      
+      // Scale from sent image space to display space
+      const scaleX = videoDisplayWidth / sentWidth
+      const scaleY = videoDisplayHeight / sentHeight
 
       const ctx = canvas.getContext('2d')
       ctx.clearRect(0, 0, canvas.width, canvas.height)
@@ -470,7 +629,8 @@ function LiveDetection({ userRole }) {
           return // Skip invalid bboxes
         }
 
-        // Scale bounding box to match video display size
+        // Scale bounding box from sent image coordinates to video display size
+        // Backend coordinates are in the sent image's space (e.g., 960px width)
         const scaledX1 = x1 * scaleX
         const scaledY1 = y1 * scaleY
         const scaledX2 = x2 * scaleX
@@ -479,9 +639,13 @@ function LiveDetection({ userRole }) {
         const height = scaledY2 - scaledY1
 
         // Mirror X coordinates horizontally to match mirrored video display
-        // Video is displayed mirrored (like a mirror), but backend coordinates are not mirrored
-        const mirroredX1 = canvas.width - scaledX2
-        const mirroredX2 = canvas.width - scaledX1
+        // Video is displayed mirrored via CSS transform: scaleX(-1)
+        // Backend coordinates are in original (non-mirrored) space
+        // To mirror: newX = canvasWidth - oldX
+        // For a box: mirror the right edge to become left, left edge to become right
+        const mirroredX1 = canvas.width - scaledX2  // Right edge becomes left edge
+        const mirroredX2 = canvas.width - scaledX1  // Left edge becomes right edge
+        const mirroredWidth = mirroredX2 - mirroredX1  // Should equal width
 
         // Choose color based on recognition status
         if (detection.recognized) {
@@ -496,11 +660,11 @@ function LiveDetection({ userRole }) {
           ctx.lineWidth = 2
         }
 
-        // Draw filled rectangle (using mirrored X coordinates)
-        ctx.fillRect(mirroredX1, scaledY1, width, height)
+        // Draw filled rectangle using mirrored coordinates
+        ctx.fillRect(mirroredX1, scaledY1, mirroredWidth, height)
         
         // Draw border
-        ctx.strokeRect(mirroredX1, scaledY1, width, height)
+        ctx.strokeRect(mirroredX1, scaledY1, mirroredWidth, height)
 
         // Draw label
         if (detection.recognized && detection.employee_name) {
@@ -510,7 +674,7 @@ function LiveDetection({ userRole }) {
           const label = `${detection.employee_name} (${(detection.similarity * 100).toFixed(1)}%)`
           const textWidth = ctx.measureText(label).width
           
-          // Draw label background (using mirrored X coordinate)
+          // Draw label background using mirrored X coordinate
           ctx.fillStyle = 'rgba(16, 185, 129, 0.9)'
           ctx.fillRect(mirroredX1, scaledY1 - 25, textWidth + 10, 22)
           
@@ -525,7 +689,7 @@ function LiveDetection({ userRole }) {
           const label = 'Unknown'
           const textWidth = ctx.measureText(label).width
           
-          // Draw label background (using mirrored X coordinate)
+          // Draw label background using mirrored X coordinate
           ctx.fillStyle = 'rgba(245, 158, 11, 0.9)'
           ctx.fillRect(mirroredX1, scaledY1 - 22, textWidth + 10, 20)
           

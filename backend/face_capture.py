@@ -10,7 +10,78 @@ import onnxruntime as ort
 import os
 import base64
 import json
+import sys
 
+# Add common directory to path for GPU_Check import
+sys.path.append(os.path.join(os.path.dirname(__file__), 'common'))
+try:
+    from GPU_Check import get_onnx_provider
+except ImportError:
+    # Fallback if GPU_Check not available
+    def get_onnx_provider():
+        available_providers = ort.get_available_providers()
+        providers = []
+        if 'CUDAExecutionProvider' in available_providers:
+            providers.append('CUDAExecutionProvider')
+        providers.append('CPUExecutionProvider')
+        return providers
+
+
+# ============================================================================
+# QUALITY SETTINGS - GPU vs CPU
+# ============================================================================
+# Based on Buffalo SCRFD (det_10g.onnx) model specifications:
+# - Optimal: 640x640 (standard balance point)
+# - GPU practical max: 1024x1024 (efficient higher resolution)
+# - Minimum: 320x320 (not recommended, accuracy degrades)
+# - Must be divisible by 32 (for stride compatibility)
+
+# CPU settings (current/default) - optimized for performance
+DETECT_SIZE_CPU = (640, 640)  # Optimal for CPU - standard balance point
+DETECTION_THRESHOLD_CPU = 0.5
+QUALITY_CONFIDENCE_CPU = 0.5
+NMS_THRESHOLD_CPU = 0.4
+
+# GPU settings (higher quality - more strict) - better for capturing all people
+DETECT_SIZE_GPU = (1024, 1024)  # Better quality than 640x640, more efficient than 1280x1280
+DETECTION_THRESHOLD_GPU = 0.7  # Higher = fewer false positives, better quality
+QUALITY_CONFIDENCE_GPU = 0.6   # Higher = stricter quality checks
+NMS_THRESHOLD_GPU = 0.3        # Lower = better duplicate suppression
+
+# Active settings (will be set based on GPU availability)
+DETECT_SIZE = DETECT_SIZE_CPU
+DETECTION_THRESHOLD = DETECTION_THRESHOLD_CPU
+QUALITY_CONFIDENCE = QUALITY_CONFIDENCE_CPU
+NMS_THRESHOLD = NMS_THRESHOLD_CPU
+
+def _is_gpu_available():
+    """Check if GPU is available and being used"""
+    try:
+        available_providers = ort.get_available_providers()
+        return 'CUDAExecutionProvider' in available_providers
+    except:
+        return False
+
+def _update_settings_for_hardware():
+    """Update detection settings based on available hardware"""
+    global DETECTION_THRESHOLD, QUALITY_CONFIDENCE, NMS_THRESHOLD, DETECT_SIZE
+    
+    if _is_gpu_available():
+        DETECT_SIZE = DETECT_SIZE_GPU
+        DETECTION_THRESHOLD = DETECTION_THRESHOLD_GPU
+        QUALITY_CONFIDENCE = QUALITY_CONFIDENCE_GPU
+        NMS_THRESHOLD = NMS_THRESHOLD_GPU
+        print(f"[INFO] face_capture.py: GPU detected - Using high-quality settings:")
+        print(f"       Resolution: {DETECT_SIZE[0]}x{DETECT_SIZE[1]}")
+        print(f"       Detection: {DETECTION_THRESHOLD}, Quality: {QUALITY_CONFIDENCE}, NMS: {NMS_THRESHOLD}")
+    else:
+        DETECT_SIZE = DETECT_SIZE_CPU
+        DETECTION_THRESHOLD = DETECTION_THRESHOLD_CPU
+        QUALITY_CONFIDENCE = QUALITY_CONFIDENCE_CPU
+        NMS_THRESHOLD = NMS_THRESHOLD_CPU
+        print(f"[INFO] face_capture.py: CPU mode - Using standard settings:")
+        print(f"       Resolution: {DETECT_SIZE[0]}x{DETECT_SIZE[1]}")
+        print(f"       Detection: {DETECTION_THRESHOLD}, Quality: {QUALITY_CONFIDENCE}, NMS: {NMS_THRESHOLD}")
 
 # ============================================================================
 # MODEL LOADING (Singleton pattern)
@@ -21,12 +92,13 @@ _rec_session = None
 
 
 def load_models():
-    """Load face detection and recognition models (lazy loading)"""
+    """Load face detection and recognition models with GPU support if available"""
     global _models_loaded, _det_session, _rec_session
     
     if _models_loaded:
         return _det_session, _rec_session
     
+    print("Loading face recognition models (face_capture.py)...")
     try:
         # Get the directory where this script is located, then look for buffalo_l folder
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,11 +111,55 @@ def load_models():
         if not os.path.exists(rec_model_path):
             raise FileNotFoundError(f"Recognition model not found: {rec_model_path}")
         
-        _det_session = ort.InferenceSession(det_model_path, providers=['CPUExecutionProvider'])
-        _rec_session = ort.InferenceSession(rec_model_path, providers=['CPUExecutionProvider'])
+        # Get optimal execution providers (GPU if available, CPU as fallback)
+        providers = get_onnx_provider()
+        
+        # Log which hardware will be used
+        if 'CUDAExecutionProvider' in providers:
+            print("[INFO] face_capture.py: CUDA GPU available - using GPU acceleration")
+        else:
+            import os
+            print(f"[INFO] face_capture.py: Using CPU with {os.cpu_count()} cores")
+        
+        # Configure session options for better performance
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 0  # Use all CPU cores
+        sess_options.inter_op_num_threads = 0
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        # CPU provider options (only used if CPU is selected)
+        cpu_provider_options = {
+            'arena_extend_strategy': 'kSameAsRequested',
+            'enable_cpu_mem_arena': True,
+        }
+        
+        # Determine provider options based on selected providers
+        provider_options = []
+        if 'CUDAExecutionProvider' not in providers:
+            provider_options = [cpu_provider_options]
+        
+        # Load detection model
+        _det_session = ort.InferenceSession(
+            det_model_path,
+            sess_options=sess_options,
+            providers=providers,
+            provider_options=provider_options if provider_options else None
+        )
+        
+        # Load recognition model
+        _rec_session = ort.InferenceSession(
+            rec_model_path,
+            sess_options=sess_options,
+            providers=providers,
+            provider_options=provider_options if provider_options else None
+        )
         
         _models_loaded = True
-        print(f"[OK] Models loaded successfully")
+        actual_providers = _det_session.get_providers()
+        print(f"[OK] face_capture.py: Models loaded successfully using: {actual_providers}")
+        
+        # Update detection settings based on hardware (GPU vs CPU)
+        _update_settings_for_hardware()
         
         return _det_session, _rec_session
         
@@ -80,8 +196,10 @@ def base64_to_image(base64_string):
 # ============================================================================
 # FACE DETECTION
 # ============================================================================
-def nms(boxes, scores, threshold=0.4):
+def nms(boxes, scores, threshold=None):
     """Non-Maximum Suppression to remove duplicate detections"""
+    if threshold is None:
+        threshold = NMS_THRESHOLD
     if len(boxes) == 0:
         return []
     
@@ -118,19 +236,22 @@ def nms(boxes, scores, threshold=0.4):
     return keep
 
 
-def detect_faces(frame, threshold=0.5):
+def detect_faces(frame, threshold=None):
     """Detect faces in frame"""
+    if threshold is None:
+        threshold = DETECTION_THRESHOLD
     det_session, _ = load_models()
     
     h, w = frame.shape[:2]
+    detect_w, detect_h = DETECT_SIZE
     
     # Resize maintaining aspect ratio
-    scale = min(640 / w, 640 / h)
+    scale = min(detect_w / w, detect_h / h)
     new_w, new_h = int(w * scale), int(h * scale)
     resized = cv2.resize(frame, (new_w, new_h))
     
     # Prepare input with padding
-    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    img = np.zeros((detect_h, detect_w, 3), dtype=np.uint8)
     img[:new_h, :new_w] = resized
     
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
@@ -148,7 +269,8 @@ def detect_faces(frame, threshold=0.5):
         score_map = outputs[idx]
         bbox_map = outputs[idx + 3]
         
-        height, width = 640 // stride, 640 // stride
+        detect_w, detect_h = DETECT_SIZE
+        height, width = detect_h // stride, detect_w // stride
         
         # Generate anchors
         anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
@@ -259,8 +381,8 @@ def check_face_quality(frame, bbox):
     """Check if face meets quality requirements"""
     x1, y1, x2, y2, conf = bbox
     
-    # Check confidence
-    if conf < 0.5:
+    # Check confidence (uses GPU/CPU appropriate threshold)
+    if conf < QUALITY_CONFIDENCE:
         return False, "Low confidence"
     
     # Check size
@@ -338,7 +460,7 @@ def process_images_to_embeddings(images_base64):
                 continue
             
             # Detect faces
-            faces = detect_faces(frame, threshold=0.5)
+            faces = detect_faces(frame)  # Uses GPU/CPU appropriate threshold
             
             if len(faces) == 0:
                 print(f"[WARNING] No face detected in {angle_name} image")
@@ -492,7 +614,7 @@ def capture_face_embeddings_from_camera(required_angles=5, show_preview=False):
                 attempts += 1
                 
                 # Detect faces
-                faces = detect_faces(frame, threshold=0.5)
+                faces = detect_faces(frame)  # Uses GPU/CPU appropriate threshold
                 
                 quality_ok = False
                 quality_msg = "No face detected"

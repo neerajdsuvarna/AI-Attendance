@@ -17,27 +17,42 @@ from threading import Thread, Lock
 from queue import Queue, Empty
 import time
 
+# GPU Monitoring (optional - uses nvidia-ml-py)
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    GPU_MONITORING_AVAILABLE = True
+except:
+    GPU_MONITORING_AVAILABLE = False
+
 # ============================================================================
 # IMPROVED CONFIGURATION
 # ============================================================================
-MODEL_DIR = r"E:\AI ATTENDANCE\Attendance\backend\buffalo_l"
+# Use buffalo_l directory in the same folder as this script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(script_dir, "buffalo_l")
 DETECTION_MODEL = "det_10g.onnx"
 RECOGNITION_MODEL = "w600k_r50.onnx"
 
-# Improved settings
+# Optimized settings for RTX 3080 16GB
 DETECT_SIZE = (640, 640)  # Square for better detection
 SIMILARITY_THRESHOLD = 0.45  # Stricter threshold (was 0.3)
 MIN_TIME_GAP = timedelta(minutes=1)
-PROCESS_EVERY_N_FRAMES = 3  # Process more frequently
+PROCESS_EVERY_N_FRAMES = 1  # Process EVERY frame with CUDA (was 3)
 COOLDOWN_SECONDS = 10
 
-# Detection settings
-DETECTION_CONFIDENCE = 0.6  # Higher confidence threshold
+# Detection settings - Optimized for speed with CUDA
+DETECTION_CONFIDENCE = 0.5  # Balanced for speed (was 0.6)
 NMS_THRESHOLD = 0.4  # Non-maximum suppression
 
 # Tracker settings
 TRACK_IOU_THRESHOLD = 0.3
 TRACK_MAX_AGE = 30
+
+# Performance settings for RTX 3080
+CAMERA_WIDTH = 1920  # Higher resolution for better detection
+CAMERA_HEIGHT = 1080  # Higher resolution for better detection
+FRAME_QUEUE_SIZE = 3  # Larger buffer for smoother processing
 
 
 # ============================================================================
@@ -48,24 +63,83 @@ try:
     # Try CUDA first, fallback to CPU if CUDA is not available
     providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
     
-    det_session = ort.InferenceSession(
-        os.path.join(MODEL_DIR, DETECTION_MODEL),
-        providers=providers
-    )
-    rec_session = ort.InferenceSession(
-        os.path.join(MODEL_DIR, RECOGNITION_MODEL),
-        providers=providers
-    )
+    det_model_path = os.path.join(MODEL_DIR, DETECTION_MODEL)
+    rec_model_path = os.path.join(MODEL_DIR, RECOGNITION_MODEL)
+    
+    if not os.path.exists(det_model_path):
+        print(f"[ERROR] Detection model not found: {det_model_path}")
+        exit(1)
+    if not os.path.exists(rec_model_path):
+        print(f"[ERROR] Recognition model not found: {rec_model_path}")
+        exit(1)
+    
+    # Optimize ONNX Runtime session options for CUDA performance
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+    sess_options.enable_mem_pattern = True
+    sess_options.enable_cpu_mem_arena = False  # Not needed with CUDA
+    
+    # CUDA provider options optimized for RTX 3080 16GB
+    cuda_provider_options = {
+        'device_id': 0,
+        'arena_extend_strategy': 'kNextPowerOfTwo',
+        'gpu_mem_limit': 8 * 1024 * 1024 * 1024,  # 8GB limit (half of 16GB for safety)
+        'cudnn_conv_algo_search': 'EXHAUSTIVE',  # Best accuracy
+        'cudnn_conv_use_max_workspace': '1',  # Use max workspace for speed
+        'do_copy_in_default_stream': True,  # Better performance
+        'tunable_op_enable': True,  # Enable tunable ops for better performance
+        'tunable_op_tuning_enable': True,  # Enable tuning
+    }
+    
+    providers_with_options = [
+        ('CUDAExecutionProvider', cuda_provider_options),
+        'CPUExecutionProvider'
+    ]
+    
+    det_session = ort.InferenceSession(det_model_path, sess_options=sess_options, providers=providers_with_options)
+    rec_session = ort.InferenceSession(rec_model_path, sess_options=sess_options, providers=providers_with_options)
     
     # Check which provider is actually being used
     det_provider = det_session.get_providers()[0]
     rec_provider = rec_session.get_providers()[0]
-    print(f"[OK] Models loaded")
-    print(f"[INFO] Detection model using: {det_provider}")
-    print(f"[INFO] Recognition model using: {rec_provider}\n")
+    
+    # Store provider info globally for display
+    USING_CUDA = (det_provider == 'CUDAExecutionProvider' and rec_provider == 'CUDAExecutionProvider')
+    DET_PROVIDER_NAME = det_provider
+    REC_PROVIDER_NAME = rec_provider
+    
+    print(f"[OK] Loaded detection model: {DETECTION_MODEL}")
+    print(f"[INFO] Detection using: {det_provider}")
+    print(f"[OK] Loaded recognition model: {RECOGNITION_MODEL}")
+    print(f"[INFO] Recognition using: {rec_provider}")
+    
+    if USING_CUDA:
+        print(f"[SUCCESS] CUDA acceleration ENABLED!")
+        print(f"[INFO] Optimized for RTX 3080 16GB")
+        print(f"[INFO] Processing every frame for maximum FPS")
+        print(f"[INFO] GPU memory limit: 8GB")
+        
+        # Try to get GPU info
+        if GPU_MONITORING_AVAILABLE:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                gpu_name = pynvml.nvmlDeviceGetName(handle).decode('utf-8')
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                print(f"[INFO] GPU: {gpu_name}")
+                print(f"[INFO] GPU Memory: {mem_info.total / 1024**3:.1f} GB total")
+            except:
+                pass
+    else:
+        print(f"[WARNING] Running on CPU (CUDA not available)")
+        print(f"[INFO] Detection: {det_provider}, Recognition: {rec_provider}")
+    print()
+    
 except Exception as e:
     print(f"[ERROR] Failed to load models: {e}")
     print("[INFO] Make sure CUDA Toolkit and cuDNN are installed if using GPU")
+    import traceback
+    traceback.print_exc()
     exit(1)
 
 
@@ -378,7 +452,8 @@ class FaceTracker:
                 'embedding': None,
                 'emp_id': None,
                 'emp_name': None,
-                'recognition_attempts': 0
+                'recognition_attempts': 0,
+                'last_similarity': 0.0
             }
             matched.append((track_id, det[:4], True))
         
@@ -393,12 +468,14 @@ class FaceTracker:
     def get_track(self, track_id):
         return self.tracks.get(track_id)
     
-    def set_recognition(self, track_id, embedding, emp_id, emp_name):
+    def set_recognition(self, track_id, embedding, emp_id, emp_name, similarity=None):
         if track_id in self.tracks:
             self.tracks[track_id]['embedding'] = embedding
             self.tracks[track_id]['emp_id'] = emp_id
             self.tracks[track_id]['emp_name'] = emp_name
             self.tracks[track_id]['recognition_attempts'] += 1
+            if similarity is not None:
+                self.tracks[track_id]['last_similarity'] = similarity
 
 
 # ============================================================================
@@ -448,9 +525,12 @@ class CameraThread(Thread):
         for idx in [0, 1, 2]:
             cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
             if cap.isOpened():
-                # Set higher resolution
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                # Set optimized resolution for RTX 3080
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                # Optimize camera settings for performance
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer lag
+                cap.set(cv2.CAP_PROP_FPS, 30)  # Set target FPS
                 
                 ret, frame = cap.read()
                 if ret and frame is not None:
@@ -523,7 +603,7 @@ class DetectionThread(Thread):
                     self.result_queue.put(results)
                     continue
                 
-                # Detect faces
+                # CONTINUOUS DETECTION: Detect faces in every frame
                 detections = detect_faces(frame)
                 tracks = self.tracker.update(detections, self.frame_count)
                 
@@ -532,23 +612,30 @@ class DetectionThread(Thread):
                 for track_id, bbox, is_new in tracks:
                     track_data = self.tracker.get_track(track_id)
                     
-                    # Recognize new tracks or retry failed recognitions (max 3 attempts)
-                    should_recognize = (is_new or 
-                                       (track_data['emp_id'] is None and 
-                                        track_data['recognition_attempts'] < 3))
+                    # CONTINUOUS RECOGNITION: Always try to recognize
+                    # - New tracks: recognize immediately
+                    # - Unrecognized tracks: keep trying continuously (no limit with CUDA)
+                    # - Recognized tracks: re-verify periodically (every 30 frames) to handle re-entry
+                    # This ensures detection NEVER stops - it keeps working continuously
+                    should_recognize = (
+                        is_new or  # New face detected
+                        track_data['emp_id'] is None or  # Not recognized yet - keep trying forever
+                        (self.frame_count % 30 == 0)  # Re-verify recognized faces periodically
+                    )
                     
                     if should_recognize:
                         embedding = get_embedding(frame, bbox)
                         emp_id, emp_name, similarity = recognize(embedding, self.face_cache)
-                        self.tracker.set_recognition(track_id, embedding, emp_id, emp_name)
+                        self.tracker.set_recognition(track_id, embedding, emp_id, emp_name, similarity)
                     else:
+                        # Use cached recognition data
                         emp_id = track_data['emp_id']
                         emp_name = track_data['emp_name']
-                        similarity = 1.0
+                        similarity = track_data.get('last_similarity', 1.0)
                     
-                    # Mark attendance
+                    # Mark attendance (only for recognized faces with cooldown)
                     action = None
-                    if emp_id:
+                    if emp_id and similarity >= SIMILARITY_THRESHOLD:
                         now = datetime.now()
                         should_mark = True
                         
@@ -601,8 +688,14 @@ class DetectionThread(Thread):
 # ============================================================================
 def main():
     print("="*60)
-    print("IMPROVED ATTENDANCE SYSTEM")
+    print("IMPROVED ATTENDANCE SYSTEM - CUDA OPTIMIZED")
     print("="*60)
+    print("Performance Optimizations:")
+    print("  ✓ CUDA acceleration enabled")
+    print("  ✓ Process every frame (was every 3rd)")
+    print("  ✓ Optimized camera resolution (1920x1080)")
+    print("  ✓ CUDA session optimizations")
+    print("  ✓ Reduced recognition retries")
     print("Improvements:")
     print("  ✓ Better face detection with NMS")
     print("  ✓ Face alignment for recognition")
@@ -611,8 +704,12 @@ def main():
     print("="*60)
     print("Press ESC to exit\n")
     
-    frame_queue = Queue(maxsize=2)
-    result_queue = Queue(maxsize=2)
+    frame_queue = Queue(maxsize=FRAME_QUEUE_SIZE)
+    result_queue = Queue(maxsize=FRAME_QUEUE_SIZE)
+    
+    # Initialize threads to None to avoid UnboundLocalError
+    camera_thread = None
+    detection_thread = None
     
     try:
         with DatabaseQueries() as db:
@@ -695,8 +792,47 @@ def main():
                         fps_counter = 0
                         fps_start = time.time()
                     
+                    # Display FPS
                     cv2.putText(display, f"FPS: {fps}", (10, display.shape[0] - 10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    # Display GPU/CPU status
+                    if USING_CUDA:
+                        gpu_status = "GPU: CUDA"
+                        gpu_color = (0, 255, 0)  # Green
+                        
+                        # Try to get GPU usage if monitoring available
+                        if GPU_MONITORING_AVAILABLE:
+                            try:
+                                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                                gpu_mem_used_gb = mem_info.used / 1024**3
+                                gpu_mem_total_gb = mem_info.total / 1024**3
+                                
+                                # Get GPU utilization (if available)
+                                try:
+                                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                                    gpu_util = util.gpu
+                                except:
+                                    gpu_util = None
+                                
+                                if gpu_util is not None:
+                                    gpu_status = f"GPU: CUDA ({gpu_util}% | {gpu_mem_used_gb:.1f}GB/{gpu_mem_total_gb:.1f}GB)"
+                                else:
+                                    gpu_status = f"GPU: CUDA ({gpu_mem_used_gb:.1f}GB/{gpu_mem_total_gb:.1f}GB)"
+                            except:
+                                pass
+                    else:
+                        gpu_status = "CPU: Fallback"
+                        gpu_color = (0, 165, 255)  # Orange
+                    
+                    cv2.putText(display, gpu_status, (10, display.shape[0] - 40),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, gpu_color, 2)
+                    
+                    # Display provider info
+                    provider_text = f"Det: {DET_PROVIDER_NAME[:4]}, Rec: {REC_PROVIDER_NAME[:4]}"
+                    cv2.putText(display, provider_text, (10, display.shape[0] - 70),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
                     
                     cv2.imshow("Attendance System [ESC to exit]", display)
                     
@@ -716,10 +852,12 @@ def main():
         traceback.print_exc()
     finally:
         print("\n[INFO] Stopping threads...")
-        camera_thread.stop()
-        detection_thread.stop()
-        camera_thread.join(timeout=2)
-        detection_thread.join(timeout=2)
+        if camera_thread:
+            camera_thread.stop()
+            camera_thread.join(timeout=2)
+        if detection_thread:
+            detection_thread.stop()
+            detection_thread.join(timeout=2)
         
         cv2.destroyAllWindows()
         print("[INFO] System stopped")

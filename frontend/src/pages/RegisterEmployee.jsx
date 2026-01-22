@@ -207,6 +207,31 @@ function RegisterEmployee({ userRole }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCameraModalOpen])
 
+  // Monitor camera state and ensure it stays active (Firefox fix)
+  useEffect(() => {
+    if (isCameraModalOpen && videoRef.current && streamRef.current) {
+      // Check if video stream is still active
+      const video = videoRef.current
+      const stream = streamRef.current
+      
+      // Ensure camera stays active after state updates (Firefox-specific)
+      if (video.srcObject && stream.active) {
+        // Video stream is active, ensure state reflects this
+        if (!isCameraActive) {
+          setIsCameraActive(true)
+        }
+        
+        // Ensure video is playing (Firefox sometimes pauses after operations)
+        if (video.paused && video.readyState >= 2) {
+          video.play().catch(err => {
+            console.warn('Video play failed:', err)
+          })
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCameraModalOpen, isCameraActive, currentAngleIndex, capturedAngles.length])
+
   const stopCamera = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop())
@@ -309,6 +334,26 @@ function RegisterEmployee({ userRole }) {
         }
       ]
       setCapturedAngles(newCapturedAngles)
+      
+      // Firefox fix: Ensure camera stays active after capture
+      // Check if video stream is still active and maintain state
+      if (videoRef.current && videoRef.current.srcObject && streamRef.current) {
+        const stream = streamRef.current
+        const video = videoRef.current
+        
+        // Ensure stream is still active
+        if (stream.active && stream.getVideoTracks().length > 0) {
+          // Stream is active, ensure camera state is maintained
+          setIsCameraActive(true)
+          
+          // Ensure video continues playing (Firefox-specific)
+          if (video.paused) {
+            video.play().catch(err => {
+              console.warn('Video play after capture failed:', err)
+            })
+          }
+        }
+      }
       
       // Move to next angle or finish
       if (currentAngleIndex < angles.length - 1) {
@@ -959,7 +1004,8 @@ function RegisterEmployee({ userRole }) {
               </div>
 
               {/* Angle instructions and controls - only show when camera is ready */}
-              {!cameraError && !isCameraLoading && isCameraActive && (
+              {/* Firefox fix: More lenient condition to handle state updates */}
+              {!cameraError && !isCameraLoading && (isCameraActive || (videoRef.current?.srcObject && streamRef.current?.active)) && (
                 <>
                   <div className="angle-progress">
                     <div className="angle-progress-bar">

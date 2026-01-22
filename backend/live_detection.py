@@ -12,6 +12,21 @@ import requests
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
 import threading
+import sys
+
+# Add common directory to path for GPU_Check import
+sys.path.append(os.path.join(os.path.dirname(__file__), 'common'))
+try:
+    from GPU_Check import get_onnx_provider
+except ImportError:
+    # Fallback if GPU_Check not available
+    def get_onnx_provider():
+        available_providers = ort.get_available_providers()
+        providers = []
+        if 'CUDAExecutionProvider' in available_providers:
+            providers.append('CUDAExecutionProvider')
+        providers.append('CPUExecutionProvider')
+        return providers
 
 # ============================================================================
 # CONFIGURATION
@@ -22,11 +37,132 @@ MODEL_DIR = os.path.join(SCRIPT_DIR, "buffalo_l")
 DETECTION_MODEL = "det_10g.onnx"
 RECOGNITION_MODEL = "w600k_r50.onnx"
 
-# Detection settings
-DETECT_SIZE = (640, 640)
-SIMILARITY_THRESHOLD = 0.45
-DETECTION_CONFIDENCE = 0.6
-NMS_THRESHOLD = 0.4
+# Detection settings - will be set based on GPU/CPU availability and camera capabilities
+# Based on Buffalo SCRFD (det_10g.onnx) model specifications:
+# - Optimal: 640x640 (standard balance point for speed/accuracy)
+# - GPU practical max: 1024x1024 (efficient higher resolution, better than 1280x1280)
+# - Minimum: 320x320 (not recommended, accuracy degrades)
+# - Must be divisible by 32 (for stride compatibility: 8, 16, 32)
+
+# CPU settings - optimized for performance
+DETECT_SIZE_CPU = (640, 640)  # Optimal for CPU - standard balance point
+
+# GPU settings - higher resolution for better detection while maintaining efficiency
+DETECT_SIZE_GPU = (1024, 1024)  # Better quality than 640x640, more efficient than 1280x1280
+
+# Camera capabilities (set by frontend)
+camera_max_width = 1920  # Default fallback
+camera_max_height = 1080  # Default fallback
+
+# Active detect size (will be set based on GPU availability and camera capabilities)
+DETECT_SIZE = DETECT_SIZE_CPU
+
+def set_camera_capabilities(max_width: int, max_height: int):
+    """Update camera capabilities from frontend"""
+    global camera_max_width, camera_max_height
+    camera_max_width = max_width
+    camera_max_height = max_height
+    print(f"[INFO] Camera capabilities updated: {max_width}x{max_height}")
+    # Recalculate optimal detect size
+    _update_settings_for_hardware()
+
+def _calculate_optimal_detect_size():
+    """
+    Calculate optimal detect size based on GPU/CPU capability.
+    
+    Flow:
+    1. First, we know camera max resolution (from frontend) - this is just for reference
+    2. Then, decide detect size based on GPU/CPU capability
+    3. Camera resolution doesn't limit detection size - we can resize any input to our target size
+    
+    Note: Camera provides input frames (e.g., 1920x1080), we resize them to detection size (e.g., 1280x1280).
+    We can always resize down, so camera resolution doesn't limit our detection size choice.
+    """
+    global camera_max_width, camera_max_height
+    
+    is_gpu = _is_gpu_available()
+    
+    # Step 1: Determine target detect size based on GPU/CPU capability
+    # Based on Buffalo SCRFD model research:
+    # - Optimal: 640x640 (standard balance)
+    # - GPU practical max: 1024x1024 (efficient higher resolution)
+    # - Minimum: 320x320 (not recommended, accuracy degrades)
+    if is_gpu:
+        # GPU: Use 1024x1024 for better quality while maintaining efficiency
+        # (1280x1280 works but less efficient, higher memory usage)
+        optimal_size = 1024
+        min_detect_size = 640  # Minimum for GPU (don't go below optimal)
+    else:
+        # CPU: Use 640x640 (optimal for CPU processing)
+        optimal_size = 640
+        min_detect_size = 320  # Absolute minimum for CPU (not recommended)
+    
+    # Step 2: Round to nearest 32 for model compatibility (required for stride: 8, 16, 32)
+    optimal_size = (optimal_size // 32) * 32
+    
+    # Step 3: Ensure we meet minimum requirement
+    optimal_size = max(optimal_size, min_detect_size)
+    
+    # Step 4: Validate size is within model's practical limits
+    # Maximum practical: 1024x1024 (larger may cause memory/performance issues)
+    if optimal_size > 1024:
+        print(f"[WARNING] Calculated size {optimal_size} exceeds practical maximum (1024), capping to 1024")
+        optimal_size = 1024
+    
+    print(f"[INFO] Optimal detect size calculation (Buffalo SCRFD model):")
+    print(f"       GPU: {is_gpu}, Target: {optimal_size}x{optimal_size}")
+    print(f"       Model specs: Min=320, Optimal=640, Max practical=1024 (must be divisible by 32)")
+    print(f"       Camera max: {camera_max_width}x{camera_max_height} (used as input, will be resized to {optimal_size}x{optimal_size})")
+    
+    return (optimal_size, optimal_size)
+
+# Default settings (CPU) - current settings
+SIMILARITY_THRESHOLD_CPU = 0.45
+DETECTION_CONFIDENCE_CPU = 0.6
+NMS_THRESHOLD_CPU = 0.4
+
+# GPU settings - higher quality (more strict thresholds)
+SIMILARITY_THRESHOLD_GPU = 0.5  # Higher threshold = more strict matching (better quality)
+DETECTION_CONFIDENCE_GPU = 0.7  # Higher confidence = fewer false positives
+NMS_THRESHOLD_GPU = 0.3  # Lower NMS = better suppression of duplicates
+
+# Active settings (will be set based on GPU availability)
+SIMILARITY_THRESHOLD = SIMILARITY_THRESHOLD_CPU
+DETECTION_CONFIDENCE = DETECTION_CONFIDENCE_CPU
+NMS_THRESHOLD = NMS_THRESHOLD_CPU
+
+def _is_gpu_available():
+    """Check if GPU is available and being used"""
+    try:
+        available_providers = ort.get_available_providers()
+        return 'CUDAExecutionProvider' in available_providers
+    except:
+        return False
+
+def _update_settings_for_hardware():
+    """Update detection settings based on available hardware and camera capabilities"""
+    global SIMILARITY_THRESHOLD, DETECTION_CONFIDENCE, NMS_THRESHOLD, DETECT_SIZE, camera_max_width, camera_max_height
+    
+    # Calculate optimal detect size based on GPU/CPU and camera capabilities
+    optimal_detect_size = _calculate_optimal_detect_size()
+    
+    # Use the calculated optimal detect size (already considers GPU/CPU and camera limits)
+    DETECT_SIZE = optimal_detect_size
+    
+    if _is_gpu_available():
+        SIMILARITY_THRESHOLD = SIMILARITY_THRESHOLD_GPU
+        DETECTION_CONFIDENCE = DETECTION_CONFIDENCE_GPU
+        NMS_THRESHOLD = NMS_THRESHOLD_GPU
+        print(f"[INFO] live_detection.py: GPU detected - Using high-quality settings:")
+        print(f"       Resolution: {DETECT_SIZE[0]}x{DETECT_SIZE[1]} (camera max: {camera_max_width}x{camera_max_height})")
+        print(f"       Similarity: {SIMILARITY_THRESHOLD}, Confidence: {DETECTION_CONFIDENCE}, NMS: {NMS_THRESHOLD}")
+    else:
+        SIMILARITY_THRESHOLD = SIMILARITY_THRESHOLD_CPU
+        DETECTION_CONFIDENCE = DETECTION_CONFIDENCE_CPU
+        NMS_THRESHOLD = NMS_THRESHOLD_CPU
+        print(f"[INFO] live_detection.py: CPU mode - Using standard settings:")
+        print(f"       Resolution: {DETECT_SIZE[0]}x{DETECT_SIZE[1]} (camera max: {camera_max_width}x{camera_max_height})")
+        print(f"       Similarity: {SIMILARITY_THRESHOLD}, Confidence: {DETECTION_CONFIDENCE}, NMS: {NMS_THRESHOLD}")
 
 # Edge function URL (will be set from environment or app config)
 EDGE_FUNCTION_URL = None
@@ -39,6 +175,8 @@ rec_session = None
 face_cache = {}  # Cache for employee embeddings
 cache_lock = threading.Lock()  # Lock for thread-safe cache operations
 cache_loading = False  # Flag to prevent concurrent cache loads
+cache_timestamp = None  # Timestamp when cache was last loaded
+CACHE_TTL_SECONDS = 30  # Cache time-to-live: refresh every 30 seconds (deleted employees disappear within 30s)
 
 # Attendance tracking configuration
 ATTENDANCE_CONFIG = {
@@ -60,7 +198,7 @@ def load_models():
     global det_session, rec_session
     
     if det_session is None or rec_session is None:
-        print("Loading face recognition models with CPU optimization...")
+        print("Loading face recognition models (live_detection.py)...")
         try:
             # Configure session options for better CPU performance
             sess_options = ort.SessionOptions()
@@ -81,32 +219,38 @@ def load_models():
                 'enable_cpu_mem_arena': True,
             }
             
-            # Try to use GPU if available, fallback to optimized CPU
-            available_providers = ort.get_available_providers()
-            providers = []
+            # Get optimal execution providers using GPU_Check module
+            # This will automatically detect GPU (CUDA) if available, otherwise use CPU
+            providers = get_onnx_provider()
             
-            if 'CUDAExecutionProvider' in available_providers:
-                print("[INFO] CUDA GPU available - using GPU acceleration")
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            if 'CUDAExecutionProvider' in providers:
+                print("[INFO] live_detection.py: CUDA GPU available - using GPU acceleration")
             else:
-                print(f"[INFO] Using CPU with {os.cpu_count()} cores")
-                providers = ['CPUExecutionProvider']
+                print(f"[INFO] live_detection.py: Using CPU with {os.cpu_count()} cores")
+            
+            # Determine provider options based on selected providers
+            provider_options = []
+            if 'CUDAExecutionProvider' not in providers:
+                provider_options = [cpu_provider_options]
             
             det_session = ort.InferenceSession(
                 os.path.join(MODEL_DIR, DETECTION_MODEL),
                 sess_options=sess_options,
                 providers=providers,
-                provider_options=[cpu_provider_options] if 'CUDAExecutionProvider' not in providers else []
+                provider_options=provider_options if provider_options else None
             )
             
             rec_session = ort.InferenceSession(
                 os.path.join(MODEL_DIR, RECOGNITION_MODEL),
                 sess_options=sess_options,
                 providers=providers,
-                provider_options=[cpu_provider_options] if 'CUDAExecutionProvider' not in providers else []
+                provider_options=provider_options if provider_options else None
             )
             
-            print(f"[OK] Models loaded successfully using: {det_session.get_providers()}")
+            print(f"[OK] live_detection.py: Models loaded successfully using: {det_session.get_providers()}")
+            
+            # Update detection settings based on hardware (GPU vs CPU)
+            _update_settings_for_hardware()
         except Exception as e:
             print(f"[ERROR] Failed to load models: {e}")
             raise
@@ -116,8 +260,10 @@ def load_models():
 # ============================================================================
 # FACE DETECTION
 # ============================================================================
-def nms(boxes, scores, threshold=0.4):
+def nms(boxes, scores, threshold=None):
     """Non-Maximum Suppression to remove duplicate detections"""
+    if threshold is None:
+        threshold = NMS_THRESHOLD
     if len(boxes) == 0:
         return []
     
@@ -154,20 +300,23 @@ def nms(boxes, scores, threshold=0.4):
     return keep
 
 
-def detect_faces(frame, threshold=DETECTION_CONFIDENCE):
+def detect_faces(frame, threshold=None):
     """Detect faces in frame using ONNX model"""
+    if threshold is None:
+        threshold = DETECTION_CONFIDENCE
     if det_session is None:
         load_models()
     
     h, w = frame.shape[:2]
+    detect_w, detect_h = DETECT_SIZE
     
     # Resize maintaining aspect ratio
-    scale = min(640 / w, 640 / h)
+    scale = min(detect_w / w, detect_h / h)
     new_w, new_h = int(w * scale), int(h * scale)
     resized = cv2.resize(frame, (new_w, new_h))
     
     # Prepare input with padding
-    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    img = np.zeros((detect_h, detect_w, 3), dtype=np.uint8)
     img[:new_h, :new_w] = resized
     
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
@@ -186,7 +335,8 @@ def detect_faces(frame, threshold=DETECTION_CONFIDENCE):
         bbox_map = outputs[idx + 3]
         kps_map = outputs[idx + 6] if len(outputs) > 6 else None
         
-        height, width = 640 // stride, 640 // stride
+        detect_w, detect_h = DETECT_SIZE
+        height, width = detect_h // stride, detect_w // stride
         
         # Generate anchors
         anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
@@ -332,22 +482,173 @@ def fetch_employee_embeddings(auth_token: str) -> Dict:
         return {'success': False, 'error': str(e)}
 
 
-def load_face_cache_from_edge(auth_token: str) -> Dict:
+def clear_face_cache():
+    """Clear the face cache (useful after employee deletion/update)"""
+    global face_cache, cache_timestamp, cache_lock
+    with cache_lock:
+        face_cache = {}
+        cache_timestamp = None
+        print("[INFO] Face cache cleared")
+
+def get_cached_embeddings(auth_token: str) -> Dict:
+    """
+    Get employee embeddings with time-based cache (auto-refreshes every CACHE_TTL_SECONDS)
+    This ensures deleted employees disappear within the TTL period
+    Returns: face_cache dict with employee_id -> {name, embedding}
+    """
+    global face_cache, cache_timestamp, cache_lock, cache_loading
+    
+    current_time = datetime.now()
+    
+    # Check if cache is valid (not expired)
+    with cache_lock:
+        cache_valid = (
+            cache_timestamp is not None and
+            len(face_cache) > 0 and
+            (current_time - cache_timestamp).total_seconds() < CACHE_TTL_SECONDS
+        )
+        
+        if cache_valid:
+            # Cache is still valid, return it
+            return face_cache
+        
+        # Cache expired or empty, need to refresh
+        # Check if another thread is already loading
+        if cache_loading:
+            # Wait a bit and check again
+            import time
+            time.sleep(0.1)
+            # If cache was loaded by another thread, return it
+            if cache_timestamp and len(face_cache) > 0:
+                return face_cache
+        
+        # Set loading flag
+        cache_loading = True
+    
+    try:
+        # Fetch fresh embeddings
+        result = fetch_employee_embeddings(auth_token)
+        
+        if not result.get('success'):
+            print(f"[ERROR] Failed to fetch embeddings: {result.get('error')}")
+            # Return existing cache if available, even if expired
+            with cache_lock:
+                return face_cache if len(face_cache) > 0 else {}
+        
+        employees = result.get('employees', [])
+        new_cache = {}
+        
+        for emp in employees:
+            emp_id = emp['id']
+            emp_name = emp['name']
+            embeddings_b64 = emp.get('face_embeddings')
+            
+            if embeddings_b64:
+                try:
+                    # Decode base64 embedding
+                    embedding_bytes = base64.b64decode(embeddings_b64)
+                    embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                    
+                    # Normalize
+                    norm = np.linalg.norm(embedding)
+                    if norm > 0:
+                        embedding = embedding / norm
+                    
+                    new_cache[emp_id] = {
+                        'name': emp_name,
+                        'email': emp.get('email', ''),
+                        'embedding': embedding
+                    }
+                except Exception as e:
+                    print(f"[WARNING] Failed to decode embedding for {emp_name}: {e}")
+                    continue
+        
+        # Update cache with lock
+        with cache_lock:
+            face_cache = new_cache
+            cache_timestamp = current_time
+            print(f"[OK] Cache refreshed: {len(new_cache)} employees (TTL: {CACHE_TTL_SECONDS}s)")
+        
+        return new_cache
+    except Exception as e:
+        print(f"[ERROR] Exception in get_cached_embeddings: {e}")
+        # Return existing cache if available, even if expired
+        with cache_lock:
+            return face_cache if len(face_cache) > 0 else {}
+    finally:
+        # Always clear loading flag
+        with cache_lock:
+            cache_loading = False
+
+def fetch_fresh_embeddings(auth_token: str) -> Dict:
+    """
+    Fetch fresh employee embeddings from edge function (no caching)
+    Returns a fresh dict with employee_id -> {name, embedding}
+    This function does NOT use or modify the global face_cache
+    """
+    try:
+        result = fetch_employee_embeddings(auth_token)
+        
+        if not result.get('success'):
+            print(f"[ERROR] Failed to fetch embeddings: {result.get('error')}")
+            return {}
+        
+        employees = result.get('employees', [])
+        cache = {}
+        
+        for emp in employees:
+            emp_id = emp['id']
+            emp_name = emp['name']
+            embeddings_b64 = emp.get('face_embeddings')
+            
+            if embeddings_b64:
+                try:
+                    # Decode base64 embedding
+                    embedding_bytes = base64.b64decode(embeddings_b64)
+                    embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                    
+                    # Normalize
+                    norm = np.linalg.norm(embedding)
+                    if norm > 0:
+                        embedding = embedding / norm
+                    
+                    cache[emp_id] = {
+                        'name': emp_name,
+                        'email': emp.get('email', ''),
+                        'embedding': embedding
+                    }
+                except Exception as e:
+                    print(f"[WARNING] Failed to decode embedding for {emp_name}: {e}")
+                    continue
+        
+        return cache
+    except Exception as e:
+        print(f"[ERROR] Exception in fetch_fresh_embeddings: {e}")
+        return {}
+
+def load_face_cache_from_edge(auth_token: str, force_reload: bool = False) -> Dict:
     """
     Load employee embeddings from edge function and build cache (thread-safe)
+    Args:
+        auth_token: Supabase auth token
+        force_reload: If True, reload cache even if it's already loaded
     Returns: face_cache dict with employee_id -> {name, embedding}
     """
     global face_cache, cache_lock, cache_loading
     
     # Check if cache is already loaded (fast path, no lock needed)
-    if len(face_cache) > 0:
+    if len(face_cache) > 0 and not force_reload:
         return face_cache
     
     # Acquire lock to prevent concurrent loading
     with cache_lock:
         # Double-check after acquiring lock (another thread might have loaded it)
-        if len(face_cache) > 0:
+        if len(face_cache) > 0 and not force_reload:
             return face_cache
+        
+        # Clear cache if forcing reload
+        if force_reload:
+            face_cache = {}
         
         # Check if another thread is already loading
         if cache_loading:
@@ -439,25 +740,31 @@ def recognize_face(embedding, face_cache: Dict) -> Tuple[Optional[str], Optional
 def detect_faces_in_frame(frame: np.ndarray, auth_token: str = None, track_attendance: bool = True) -> List[Dict]:
     """
     Detect and recognize faces in a single frame
+    Fetches fresh embeddings from edge function on every call (no cache)
     Args:
         frame: OpenCV BGR image (numpy array)
-        auth_token: Supabase auth token (optional if cache already loaded)
+        auth_token: Supabase auth token (required for fetching embeddings)
         track_attendance: Whether to track and mark attendance
     Returns:
         List of detections with bbox, employee_id, name, similarity, attendance_action
     """
-    global face_cache, attendance_tracker
+    global attendance_tracker
     
     # Load models if not loaded
     load_models()
     
-    # Load face cache if empty and token provided (thread-safe)
-    if len(face_cache) == 0 and auth_token:
-        load_face_cache_from_edge(auth_token)
-    
     # Update attendance tracker auth token if provided
     if attendance_tracker and auth_token:
         attendance_tracker.update_auth_token(auth_token)
+    
+    # Fetch fresh embeddings from edge function (no cache - always up-to-date)
+    if not auth_token:
+        print("[WARNING] No auth token provided, cannot fetch embeddings")
+        return []
+    
+    # Get employee embeddings with time-based cache (auto-refreshes every 30 seconds)
+    # This ensures deleted employees disappear within 30 seconds
+    current_face_cache = get_cached_embeddings(auth_token)
     
     # Detect faces
     detections = detect_faces(frame)
@@ -472,8 +779,8 @@ def detect_faces_in_frame(frame: np.ndarray, auth_token: str = None, track_atten
         embedding = get_embedding(frame, bbox)
         
         if embedding is not None:
-            # Recognize
-            emp_id, emp_name, similarity = recognize_face(embedding, face_cache)
+            # Recognize using fresh embeddings
+            emp_id, emp_name, similarity = recognize_face(embedding, current_face_cache)
             
             results.append({
                 'bbox': bbox,
@@ -501,6 +808,8 @@ def detect_faces_in_frame(frame: np.ndarray, auth_token: str = None, track_atten
         frame_height, frame_width = frame.shape[:2]
         results = attendance_tracker.process_detections(results, frame_width, frame_height)
     
+    # Note: current_face_cache is discarded after this function returns
+    # Next frame will fetch fresh embeddings again
     return results
 
 

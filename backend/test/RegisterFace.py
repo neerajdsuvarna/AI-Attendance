@@ -20,7 +20,9 @@ import os
 print("Loading face detection and recognition models...")
 
 try:
-    model_dir = r"E:\AI ATTENDANCE\Attendance\backend\buffalo_l"
+    # Use buffalo_l directory in the same folder as this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_dir = os.path.join(script_dir, "buffalo_l")
     det_model_path = os.path.join(model_dir, "det_10g.onnx")
     rec_model_path = os.path.join(model_dir, "w600k_r50.onnx")
     
@@ -31,11 +33,25 @@ try:
         print(f"[ERROR] Recognition model not found: {rec_model_path}")
         exit(1)
     
-    det_session = ort.InferenceSession(det_model_path, providers=['CPUExecutionProvider'])
-    rec_session = ort.InferenceSession(rec_model_path, providers=['CPUExecutionProvider'])
+    # Use CUDA with CPU fallback
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    
+    det_session = ort.InferenceSession(det_model_path, providers=providers)
+    rec_session = ort.InferenceSession(rec_model_path, providers=providers)
+    
+    # Check which provider is actually being used
+    det_provider = det_session.get_providers()[0]
+    rec_provider = rec_session.get_providers()[0]
     
     print(f"[OK] Loaded detection model: {os.path.basename(det_model_path)}")
+    print(f"[INFO] Detection using: {det_provider}")
     print(f"[OK] Loaded recognition model: {os.path.basename(rec_model_path)}")
+    print(f"[INFO] Recognition using: {rec_provider}")
+    
+    if det_provider == 'CUDAExecutionProvider':
+        print(f"[SUCCESS] CUDA acceleration ENABLED!")
+    else:
+        print(f"[WARNING] Running on CPU (CUDA not available)")
     
 except Exception as e:
     print(f"[ERROR] Failed to load models: {e}")
